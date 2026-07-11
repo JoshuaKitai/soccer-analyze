@@ -1,0 +1,12 @@
+# Core CV pipeline
+ultralytics>=8.2.0        # YOLOv8 detection + ByteTrack tracking (pulls torch CPU)
+opencv-python>=4.9.0
+numpy>=1.26.0
+
+# Analysis + visualization
+pandas>=2.1.0
+plotly>=5.18.0
+
+# Optional VLM layer (Claude vision)
+anthropic>=0.40.0
+pydantic>=2.5.0
