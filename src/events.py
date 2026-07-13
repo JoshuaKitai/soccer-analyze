@@ -26,15 +26,18 @@ from .tracking import TrackData
 POSSESSION_H_FACTOR = 0.55
 POSSESSION_R_MIN = 0.02
 POSSESSION_R_MAX = 0.12
-HYSTERESIS_KEEP = 1.35        # current owner keeps the ball within 1.35x radius
-HYSTERESIS_STEAL = 0.65      # ...unless someone else is decisively closer
+HYSTERESIS_KEEP = 1.5         # current owner keeps the ball within 1.5x radius
+HYSTERESIS_STEAL = 0.6        # ...unless someone else is decisively closer
+STEAL_CONFIRM_FRAMES = 4      # ...for this many consecutive frames
+FLIGHT_SPEED = 0.35           # ball faster than this is in flight: nobody can
+                              # ACQUIRE it (the incumbent may keep it)
 MIN_SPELL_FRAMES = 4          # ignore sub-1/7s possession blips
 SPELL_MERGE_GAP_S = 0.35      # rejoin same-player spells split by blind frames
 PASS_MAX_GAP_S = 1.5          # ball in flight longer than this isn't a pass
 PASS_MIN_DIST = 0.04          # tiny position changes aren't passes
 DRIBBLE_MIN_S = 0.8           # carry must last this long
 DRIBBLE_MIN_TRAVEL = 0.05     # and cover this much ground
-SHOT_SPEED = 0.55             # normalized units/sec — very fast release
+SHOT_SPEED = 0.45             # normalized units/sec — very fast release
 SHOT_EDGE_ZONE = 0.22         # ball must be heading into the outer 22% of frame
 
 
@@ -116,39 +119,57 @@ def _possession_per_frame(tracks: TrackData) -> np.ndarray:
 
     A player qualifies when the ball is within a radius scaled to their
     on-screen size (so a zoomed-out broadcast doesn't demand impossible
-    closeness). Hysteresis keeps possession stable: the current owner holds
-    the ball while it stays near them, unless another player gets decisively
-    closer.
+    closeness). Officials (team -1) can never own the ball. Hysteresis keeps
+    possession stable, and a steal must persist for several consecutive
+    frames before the owner switches — one frame of a defender lunging close
+    doesn't flip possession.
     """
     n = tracks.n_frames
     owner = np.full(n, -1, dtype=int)
+    ball_speed = tracks.ball_speed()
     prev = -1
+    pending, pend_count = -1, 0
     for i in range(n):
         b = tracks.ball[i]
         if np.isnan(b[0]):
-            prev = -1
+            owner[i] = -1
+            prev, pending, pend_count = -1, -1, 0
             continue
+        in_flight = not np.isnan(ball_speed[i]) and ball_speed[i] > FLIGHT_SPEED
         # ratio = distance / that player's own possession radius
         ratios: dict[int, float] = {}
         for tid, arr in tracks.players.items():
+            if tracks.teams.get(tid, -1) == -1:
+                continue    # referees and sideline officials can't possess
             p = arr[i]
             if np.isnan(p[0]):
                 continue
             r = _possession_radius(tracks, tid, i)
             ratios[tid] = float(np.linalg.norm(b - p)) / r
         if not ratios:
-            prev = -1
+            owner[i] = -1
+            prev, pending, pend_count = -1, -1, 0
             continue
         best_t = min(ratios, key=ratios.get)
         best = ratios[best_t]
         chosen = -1
         if prev in ratios and ratios[prev] <= HYSTERESIS_KEEP:
-            # incumbent keeps it unless someone is decisively closer
             chosen = prev
-            if best_t != prev and best <= HYSTERESIS_STEAL * ratios[prev] and best <= 1.0:
-                chosen = best_t
-        elif best <= 1.0:
+            challenger = (best_t != prev and best <= HYSTERESIS_STEAL * ratios[prev]
+                          and best <= 1.0 and not in_flight)
+            if challenger:
+                if pending == best_t:
+                    pend_count += 1
+                else:
+                    pending, pend_count = best_t, 1
+                if pend_count >= STEAL_CONFIRM_FRAMES:
+                    chosen = best_t
+                    pending, pend_count = -1, 0
+            else:
+                pending, pend_count = -1, 0
+        elif best <= 1.0 and not in_flight:
             chosen = best_t
+            pending, pend_count = -1, 0
         owner[i] = chosen
         prev = chosen
     return owner

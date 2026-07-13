@@ -14,5 +14,9 @@ results/
 clips/*
 !clips/.gitkeep
 
+# Web frontend
+webapp/node_modules/
+webapp/dist/
+
 # Secrets
 .env

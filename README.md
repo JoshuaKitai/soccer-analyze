@@ -66,8 +66,35 @@ pitch homography is the first roadmap item below.
 pip install -r requirements.txt
 ```
 
-CPU is fine — YOLOv8-nano processes a 15s clip in ~1–3 minutes. First run
-downloads the model weights (~6 MB) automatically.
+CPU is fine — YOLOv8-nano processes a 15s clip in ~3–6 minutes (two detection
+passes: players at 960px, ball at 1280px). First run downloads the model
+weights (~6 MB) automatically.
+
+## Web app (React + FastAPI)
+
+The full experience — upload clips from the browser, watch analysis progress,
+and explore every play with the synced video + 3D dashboard:
+
+```powershell
+# one-time frontend build
+cd webapp
+npm install
+npm run build
+cd ..
+
+# run the server (serves API + built frontend)
+python -m uvicorn server:app --port 8000
+```
+
+Open http://localhost:8000. For frontend development with hot reload:
+
+```powershell
+python -m uvicorn server:app --port 8000   # terminal 1: API
+cd webapp; npm run dev                      # terminal 2: Vite dev server (proxies /api)
+```
+
+API: `POST /api/analyze` (upload, returns job id) · `GET /api/jobs/{id}` ·
+`GET /api/plays` · `GET /api/plays/{name}` · `GET /api/plays/{name}/video`.
 
 ## Usage
 

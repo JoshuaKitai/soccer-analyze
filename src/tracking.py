@@ -50,11 +50,16 @@ STITCH_BASE_DIST = 0.035   # merge threshold at zero gap...
 STITCH_DIST_PER_S = 0.10   # ...growing with gap length
 STITCH_COLOR_DIST = 60.0   # max BGR distance for "same jersey"
 
-# ball linking
-BALL_GATE = 0.05           # base acceptance radius around prediction
-BALL_GATE_GROWTH = 0.012   # per missing frame
-BALL_REACQUIRE_CONF = 0.30 # a strong detection can restart a lost track
-BALL_REACQUIRE_GAP = 8     # after this many blind frames
+# ball linking (global path optimization over candidates)
+BALL_MAX_LINK_GAP = 25     # frames a trajectory may skip between detections
+BALL_STEP_ALLOW = 0.045    # allowed travel per frame of gap before penalty
+BALL_STEP_BASE = 0.035     # slack at zero gap
+BALL_TELEPORT_COST = 9.0   # cost cap: re-acquiring far away is possible but dear
+BALL_GAP_COST = 0.15       # per skipped frame
+BALL_CONF_W = 3.0          # weight of detection confidence
+BALL_PROX_NEAR = 0.15      # full proximity bonus inside this player distance
+BALL_PROX_FAR = 0.30       # beyond this from every player: penalized (penalty
+                           # spots and sideline clutter live far from players)
 
 
 @dataclass
@@ -184,44 +189,67 @@ def _camera_motion(prev_gray, gray, boxes_px, w, h):
 
 
 def _link_ball(candidates: list[list[tuple[float, float, float]]],
-               n: int) -> np.ndarray:
-    """Turn per-frame ball candidates into one trajectory via motion gating.
+               n: int, players: dict[int, np.ndarray]) -> np.ndarray:
+    """Choose the ball trajectory by global path optimization.
 
-    Seed on a confident detection; each subsequent frame accepts the candidate
-    nearest the constant-velocity prediction if it's inside a gate that grows
-    while the ball is unseen. A lost track can be re-acquired by a strong
-    detection. Random false positives away from the trajectory are ignored.
+    Every detection becomes a node scored by confidence and proximity to a
+    tracked player (the real ball lives at someone's feet or in flight
+    between players; penalty spots and sideline clutter don't). A dynamic
+    program then finds the highest-scoring path through the whole clip, where
+    moving between nodes costs more the less physically plausible the jump.
+    Unlike greedy frame-by-frame linking, one bad detection can't hijack the
+    track: committing to it has to beat every alternative path.
     """
+    nodes: list[tuple[int, float, float, float]] = []   # frame, x, y, conf
+    for f, cands in enumerate(candidates):
+        for (x, y, conf) in cands:
+            nodes.append((f, x, y, conf))
     pos = np.full((n, 2), np.nan)
-    vel = np.zeros(2)
-    last: np.ndarray | None = None
-    missing = 0
+    if not nodes:
+        return pos
 
-    for i in range(n):
-        cands = candidates[i]
-        chosen = None
-        if last is not None:
-            pred = last + vel * min(missing + 1, 6)
-            gate = BALL_GATE + BALL_GATE_GROWTH * missing
-            best_d = gate
-            for (x, y, conf) in cands:
-                d = float(np.hypot(x - pred[0], y - pred[1]))
-                if d < best_d:
-                    best_d, chosen = d, (x, y)
-        if chosen is None and cands:
-            # re-acquire: strongest detection, if we've been blind a while
-            x, y, conf = max(cands, key=lambda c: c[2])
-            if last is None or (missing >= BALL_REACQUIRE_GAP and conf >= BALL_REACQUIRE_CONF):
-                chosen = (x, y)
-                vel = np.zeros(2)
-        if chosen is not None:
-            p = np.array(chosen)
-            if last is not None and missing == 0:
-                vel = 0.6 * vel + 0.4 * (p - last)
-            last, missing = p, 0
-            pos[i] = p
-        else:
-            missing += 1
+    def emission(f: int, x: float, y: float, conf: float) -> float:
+        dmin = np.inf
+        for arr in players.values():
+            p = arr[f]
+            if not np.isnan(p[0]):
+                dmin = min(dmin, float(np.hypot(x - p[0], y - p[1])))
+        score = BALL_CONF_W * conf
+        if np.isfinite(dmin):
+            score += 1.2 * max(0.0, 1.0 - dmin / BALL_PROX_NEAR)
+            if dmin > BALL_PROX_FAR:
+                score -= 1.0
+        return score
+
+    nodes.sort(key=lambda t: t[0])
+    em = [emission(f, x, y, c) for (f, x, y, c) in nodes]
+    best = list(em)                       # best path score ending at node i
+    parent = [-1] * len(nodes)
+
+    for i, (fi, xi, yi, _) in enumerate(nodes):
+        j = i - 1
+        while j >= 0:
+            fj, xj, yj, _ = nodes[j]
+            gap = fi - fj
+            if gap > BALL_MAX_LINK_GAP:
+                break
+            if gap >= 1:
+                dist = float(np.hypot(xi - xj, yi - yj))
+                allowed = BALL_STEP_BASE + BALL_STEP_ALLOW * gap
+                penalty = min(3.0 * (dist / allowed) ** 2, BALL_TELEPORT_COST)
+                penalty += BALL_GAP_COST * (gap - 1)
+                cand = best[j] + em[i] - penalty
+                if cand > best[i]:
+                    best[i] = cand
+                    parent[i] = j
+            j -= 1
+
+    # backtrack from the best-scoring endpoint
+    i = int(np.argmax(best))
+    while i != -1:
+        f, x, y, _ = nodes[i]
+        pos[f] = (x, y)
+        i = parent[i]
     return _interpolate_gaps(pos, max_gap=15)
 
 
@@ -363,9 +391,6 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
     cap.release()
     n = len(frames_players)
 
-    # assemble ball trajectory
-    ball = _link_ball(ball_candidates, n)
-
     # assemble player arrays + heights
     all_ids = sorted({tid for f in frames_players for tid in f})
     players: dict[int, np.ndarray] = {}
@@ -393,10 +418,13 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
         players[tid] = _interpolate_gaps(players[tid], max_gap=10)
         heights[tid] = _interpolate_gaps(heights[tid], max_gap=10)
 
-    # team assignment with referee/keeper rejection. The outlier bar is
-    # deliberately high (1.15x the inter-kit distance): wrongly exiling a real
-    # player destroys pass detection for every ball he touches, while letting
-    # a referee slip onto a team merely adds one phantom defender.
+    # ball trajectory: global path optimization, informed by player positions
+    ball = _link_ball(ball_candidates, n, players)
+
+    # team assignment with referee/keeper rejection: a track is exiled to -1
+    # when its kit color fits neither cluster (relative to the inter-kit
+    # distance) — or when it hugs the frame border for most of its life,
+    # which is the signature of assistant referees, coaches, and ball kids.
     teams: dict[int, int] = {tid: -1 for tid in players}
     tids_c = [t for t in players if t in colors]
     if len(tids_c) >= 2:
@@ -404,10 +432,18 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
         labels, centers = _kmeans2(mat)
         sep = float(np.linalg.norm(centers[0] - centers[1]))
         for t, lab in zip(tids_c, labels):
-            if sep > 1e-6 and np.linalg.norm(colors[t] - centers[lab]) > 1.15 * sep:
+            if sep > 1e-6 and np.linalg.norm(colors[t] - centers[lab]) > 1.0 * sep:
                 teams[t] = -1   # far outside both kits: referee or goalkeeper
             else:
                 teams[t] = int(lab)
+    for tid, arr in players.items():
+        v = arr[~np.isnan(arr[:, 0])]
+        if len(v) == 0:
+            continue
+        near_edge = ((v[:, 0] < 0.03) | (v[:, 0] > 0.97)
+                     | (v[:, 1] < 0.05) | (v[:, 1] > 0.95))
+        if near_edge.mean() > 0.8:
+            teams[tid] = -1     # lives on the frame border: sideline official
 
     return TrackData(fps=fps, n_frames=n, ball=ball, players=players,
                      teams=teams, frame_size=(w, h),

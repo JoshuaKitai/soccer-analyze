@@ -30,8 +30,10 @@ def _clean(arr) -> list:
     return out
 
 
-def build_dashboard(tracks: TrackData, events: Events, momentum: np.ndarray,
-                    report: dict, out_html: str, video_file: str | None = None) -> None:
+def build_play_data(tracks: TrackData, events: Events, momentum: np.ndarray,
+                    report: dict, video_file: str | None = None) -> dict:
+    """The complete play as one JSON-safe dict — consumed by the static
+    dashboard template AND served by the web API to the React frontend."""
     t = np.arange(tracks.n_frames) / tracks.fps
 
     players = []
@@ -48,7 +50,7 @@ def build_dashboard(tracks: TrackData, events: Events, momentum: np.ndarray,
           + [{"t": round(s.frame / tracks.fps, 2), "label": "SHOT"} for s in events.shots])
     ev.sort(key=lambda e: e["t"])
 
-    data = {
+    return {
         "name": report.get("name", "play"),
         "fps": tracks.fps,
         "n": tracks.n_frames,
@@ -61,9 +63,15 @@ def build_dashboard(tracks: TrackData, events: Events, momentum: np.ndarray,
         "momentum": _clean(momentum),
         "score": report["score"],
         "subscores": report["subscores"],
+        "detail": report.get("detail", {}),
         "events": ev,
         "video": video_file,
     }
+
+
+def build_dashboard(tracks: TrackData, events: Events, momentum: np.ndarray,
+                    report: dict, out_html: str, video_file: str | None = None) -> None:
+    data = build_play_data(tracks, events, momentum, report, video_file)
 
     from plotly.offline import get_plotlyjs
 
