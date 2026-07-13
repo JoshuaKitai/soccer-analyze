@@ -11,7 +11,8 @@ venv/
 results/
 
 # Local clips (usually large / personal footage)
-clips/
+clips/*
+!clips/.gitkeep
 
 # Secrets
 .env
