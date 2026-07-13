@@ -25,8 +25,10 @@ clip.mp4
 [4] scoring.py      score = 100 · σ(k·(w·x − b))   → 0–100
    │                (optionally fused with Claude's holistic estimate)
    ▼
-[5] visualize.py    play_3d.html (trajectories in x,y,time)
-                    difficulty_space.html (all plays in 3D metric space)
+[5] visualize.py    annotated.mp4 (tracking overlay: carrier, teams, ball trail)
+    momentum.py     per-frame momentum in [-1, +1] (who controls the play)
+    frontend.py     dashboard.html — video + synced 3D graph + momentum timeline
+                    play_3d.html, difficulty_space.html
 ```
 
 The optional `--vlm` step sends sampled frames to Claude (vision), which
@@ -72,19 +74,35 @@ downloads the model weights (~6 MB) automatically.
 ```powershell
 python main.py --demo                      # synthetic play, verifies the pipeline
 python main.py clips\my_goal.mp4           # analyze a real clip
-python main.py clips\my_goal.mp4 --vlm     # + Claude semantic analysis
-python main.py clips\my_goal.mp4 --annotate  # + overlay video with tracks
+python main.py clips\my_goal.mp4 --vlm     # + VLM semantic analysis
 ```
 
 Outputs:
 
+- **`results/<name>/dashboard.html`** — the main event: your clip (with the
+  full tracking overlay burned in) side-by-side with a synced 3D graph.
+  Press play and the markers move through the graph with the video; the
+  ball's 3D path is colored by momentum, and a momentum timeline below shows
+  control swinging between the teams with PASS/DRIBBLE/SHOT markers.
+- `results/<name>/annotated.mp4` — the overlay video on its own: team-colored
+  player markers, the ball carrier highlighted, ball trail, possession HUD,
+  event flashes
 - `results/<name>/report.json` — score, subscores, event counts, VLM analysis
-- `results/<name>/play_3d.html` — interactive 3D trajectories (open in browser)
+- `results/<name>/play_3d.html` — standalone 3D trajectory view
 - `results/difficulty_space.html` — every play you've analyzed, plotted in 3D
   (technical × pressure × speed), colored by difficulty
 - `results/plays.csv` — the accumulated gallery feeding that chart
 
 For `--vlm`, set `ANTHROPIC_API_KEY` in your environment (or `ant auth login`).
+
+### Momentum
+
+`src/momentum.py` computes a per-frame momentum value in [-1, +1]: +1 means
+Team A fully in control and progressing toward goal, -1 the same for Team B.
+It combines possession, territory (how deep the ball is in the attacking
+half), and progress (ball velocity toward goal), smoothed over ~0.9 s so it
+swings the way momentum feels when you watch a game. Attack directions are
+inferred from which way each team's possessions move the ball.
 
 ## What to expect / limitations (v1)
 

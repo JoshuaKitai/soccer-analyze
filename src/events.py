@@ -77,6 +77,7 @@ class Events:
     dribbles: list[Dribble]
     shots: list[Shot]
     possessing_team_frames: np.ndarray   # per-frame team in possession (-1 = none)
+    owner_frames: np.ndarray             # per-frame owning player id (-1 = none)
 
 
 def nearest_opponent_dist(tracks: TrackData, frame: int, player: int) -> float:
@@ -215,4 +216,5 @@ def extract_events(tracks: TrackData) -> Events:
 
     team_frames = np.array([tracks.teams.get(int(o), -1) if o != -1 else -1 for o in owner])
     return Events(spells=spells, passes=passes, dribbles=dribbles,
-                  shots=shots, possessing_team_frames=team_frames)
+                  shots=shots, possessing_team_frames=team_frames,
+                  owner_frames=owner)

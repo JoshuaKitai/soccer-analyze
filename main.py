@@ -5,10 +5,9 @@ events (passes, dribbles, shots), computes a 0-100 difficulty rating from
 five measured dimensions, and renders 3D visualizations.
 
 Usage:
-    python main.py path/to/clip.mp4               # full pipeline
-    python main.py clip.mp4 --vlm                 # + Claude semantic analysis
-    python main.py clip.mp4 --annotate            # + annotated video overlay
-    python main.py --demo                         # synthetic play, no video needed
+    python main.py path/to/clip.mp4    # full pipeline (annotated video + dashboard)
+    python main.py clip.mp4 --vlm      # + VLM semantic analysis
+    python main.py --demo              # synthetic play, no video needed
 
 Outputs land in results/<clip-name>/ and every scored play is appended to
 results/plays.csv, which feeds the cross-play difficulty_space.html chart.
@@ -29,7 +28,7 @@ from src.scoring import score_play, fuse_with_vlm
 RESULTS = Path(__file__).parent / "results"
 
 
-def analyze(video_path: str | None, name: str, use_vlm: bool, annotate: bool) -> dict:
+def analyze(video_path: str | None, name: str, use_vlm: bool) -> dict:
     out_dir = RESULTS / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -74,9 +73,12 @@ def analyze(video_path: str | None, name: str, use_vlm: bool, annotate: bool) ->
     else:
         print("[4/5] VLM step skipped" + (" (needs a real video)" if use_vlm else ""))
 
-    # 5. visualize
-    print("[5/5] rendering 3D visualizations...")
+    # 5. visualize + dashboard
+    print("[5/5] rendering visualizations and dashboard...")
+    from src.frontend import build_dashboard
+    from src.momentum import compute_momentum
     from src.visualize import plot_play_3d, plot_difficulty_space, annotate_video
+
     plot_play_3d(tracks, str(out_dir / "play_3d.html"),
                  title=f"{name} — difficulty {report['score']:.0f}/100")
 
@@ -89,9 +91,14 @@ def analyze(video_path: str | None, name: str, use_vlm: bool, annotate: bool) ->
     gallery.to_csv(gallery_csv, index=False)
     plot_difficulty_space(gallery, str(RESULTS / "difficulty_space.html"))
 
-    if annotate and video_path is not None:
-        print("      writing annotated video...")
-        annotate_video(video_path, tracks, str(out_dir / "annotated.mp4"))
+    momentum = compute_momentum(tracks, events)
+    video_rel = None
+    if video_path is not None:
+        print("      writing annotated video (tracking overlay)...")
+        annotate_video(video_path, tracks, events, str(out_dir / "annotated.mp4"))
+        video_rel = "annotated.mp4"
+    build_dashboard(tracks, events, momentum, report,
+                    str(out_dir / "dashboard.html"), video_rel)
 
     (out_dir / "report.json").write_text(json.dumps(report, indent=2))
     return report
@@ -101,8 +108,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Rate the difficulty of a soccer play (0-100)")
     ap.add_argument("video", nargs="?", help="path to a ~15s clip (mp4/mov/...)")
     ap.add_argument("--demo", action="store_true", help="run on a synthetic play, no video needed")
-    ap.add_argument("--vlm", action="store_true", help="add Claude vision analysis (needs ANTHROPIC_API_KEY)")
-    ap.add_argument("--annotate", action="store_true", help="write annotated video with tracks")
+    ap.add_argument("--vlm", action="store_true", help="add VLM vision analysis (needs ANTHROPIC_API_KEY)")
     ap.add_argument("--name", help="play name for reports (default: video filename)")
     args = ap.parse_args()
 
@@ -110,7 +116,7 @@ def main() -> None:
         ap.error("provide a video path or --demo")
 
     name = args.name or (Path(args.video).stem if args.video else "demo_play")
-    report = analyze(args.video if not args.demo else None, name, args.vlm, args.annotate)
+    report = analyze(args.video if not args.demo else None, name, args.vlm)
 
     print("\n" + "=" * 46)
     print(f"  PLAY DIFFICULTY: {report['score']:.0f} / 100")
@@ -118,7 +124,8 @@ def main() -> None:
     for k, v in report["subscores"].items():
         bar = "#" * int(v / 4)
         print(f"  {k:<11} {v:5.1f}  {bar}")
-    print(f"\n  breakdown: results/{name}/report.json")
+    print(f"\n  DASHBOARD: results/{name}/dashboard.html  <- open this")
+    print(f"  breakdown: results/{name}/report.json")
     print(f"  3D play:   results/{name}/play_3d.html")
     print("  3D space:  results/difficulty_space.html")
 

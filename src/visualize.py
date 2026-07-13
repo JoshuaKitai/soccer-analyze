@@ -150,35 +150,118 @@ def plot_difficulty_space(plays: pd.DataFrame, out_html: str) -> None:
     fig.write_html(out_html, include_plotlyjs=True, full_html=True)
 
 
-def annotate_video(video_path: str, tracks: TrackData, out_path: str) -> None:
-    """Write a copy of the clip with player IDs, team colors and ball marker."""
+def _hex2bgr(hx: str) -> tuple[int, int, int]:
+    return tuple(int(hx[i:i + 2], 16) for i in (5, 3, 1))
+
+
+def _reencode_h264(src: str, dst: str) -> None:
+    """Re-encode with bundled ffmpeg so the video plays in browsers
+    (OpenCV's mp4v codec is not web-playable)."""
+    import subprocess
+    import imageio_ffmpeg
+
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [exe, "-y", "-i", src, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart", "-crf", "23", dst],
+        check=True, capture_output=True)
+
+
+def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) -> None:
+    """Write a browser-playable copy of the clip with the full tracking overlay:
+
+    - players marked with team-colored ground ellipses + IDs
+    - the ball carrier highlighted with a bright double ring
+    - the ball with a fading trail
+    - a HUD strip showing time and which team has possession
+    - event flashes (PASS / DRIBBLE / SHOT) as they happen
+    """
+    import os
+    import tempfile
+
     import cv2
 
-    hex2bgr = lambda h: tuple(int(h[i:i + 2], 16) for i in (5, 3, 1))
-    colors = {0: hex2bgr(TEAM_A), 1: hex2bgr(TEAM_B), -1: hex2bgr(MUTED)}
-    ball_c = hex2bgr(BALL)
+    colors = {0: _hex2bgr(TEAM_A), 1: _hex2bgr(TEAM_B), -1: _hex2bgr(MUTED)}
+    ball_c = _hex2bgr(BALL)
+    white = (255, 255, 255)
+    fps = tracks.fps
+
+    # event flash schedule: frame -> label (shown ~0.8 s)
+    flashes: list[tuple[int, str]] = (
+        [(p.start, "PASS") for p in events.passes]
+        + [(d.start, "DRIBBLE") for d in events.dribbles]
+        + [(s.frame, "SHOT!") for s in events.shots])
+    flash_len = int(0.8 * fps)
 
     cap = cv2.VideoCapture(video_path)
     w, h = tracks.frame_size
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), tracks.fps, (w, h))
+    tmp = tempfile.mktemp(suffix=".mp4")
+    writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    owner = events.owner_frames
+    team_frames = events.possessing_team_frames
+
     i = 0
     while i < tracks.n_frames:
         ok, frame = cap.read()
         if not ok:
             break
+
+        # players
+        carrier = int(owner[i]) if owner[i] != -1 else None
         for tid, arr in tracks.players.items():
             p = arr[i]
             if np.isnan(p[0]):
                 continue
             c = colors[tracks.teams.get(tid, -1)]
             pt = (int(p[0] * w), int(p[1] * h))
-            cv2.ellipse(frame, pt, (18, 7), 0, 0, 360, c, 2)
-            cv2.putText(frame, str(tid), (pt[0] - 8, pt[1] - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 2)
+            cv2.ellipse(frame, pt, (20, 8), 0, -35, 235, c, 3)
+            cv2.putText(frame, str(tid), (pt[0] - 7, pt[1] - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 3)
+            cv2.putText(frame, str(tid), (pt[0] - 7, pt[1] - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
+            if tid == carrier:  # highlight the player on the ball
+                cv2.ellipse(frame, pt, (28, 12), 0, 0, 360, white, 2)
+                cv2.ellipse(frame, pt, (32, 14), 0, 0, 360, ball_c, 2)
+
+        # ball trail (last ~0.7 s), fading
+        trail = tracks.ball[max(0, i - int(0.7 * fps)):i + 1]
+        pts = [(int(p[0] * w), int(p[1] * h)) for p in trail if not np.isnan(p[0])]
+        for j in range(1, len(pts)):
+            a = j / max(len(pts) - 1, 1)
+            cv2.line(frame, pts[j - 1], pts[j],
+                     tuple(int(ch * a) for ch in ball_c), max(1, int(3 * a)))
         b = tracks.ball[i]
         if not np.isnan(b[0]):
-            cv2.circle(frame, (int(b[0] * w), int(b[1] * h)), 6, ball_c, -1)
+            bp = (int(b[0] * w), int(b[1] * h))
+            cv2.circle(frame, bp, 7, ball_c, -1)
+            cv2.circle(frame, bp, 9, white, 1)
+
+        # HUD: time + possession chip
+        cv2.rectangle(frame, (0, 0), (w, 34), (20, 20, 20), -1)
+        cv2.putText(frame, f"t={i / fps:5.1f}s", (12, 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, white, 1)
+        pt_team = int(team_frames[i])
+        label = {0: "TEAM A", 1: "TEAM B", -1: "CONTESTED"}[pt_team if pt_team in (0, 1) else -1]
+        chip = colors.get(pt_team, colors[-1])
+        cv2.circle(frame, (150, 17), 8, chip, -1)
+        cv2.putText(frame, f"possession: {label}", (168, 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, white, 1)
+
+        # event flash
+        for f0, text in flashes:
+            if f0 <= i < f0 + flash_len:
+                cv2.putText(frame, text, (w // 2 - 70, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.4, (20, 20, 20), 6)
+                cv2.putText(frame, text, (w // 2 - 70, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.4, ball_c, 3)
+
         writer.write(frame)
         i += 1
     cap.release()
     writer.release()
+
+    try:
+        _reencode_h264(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
