@@ -1,0 +1,10 @@
+# ByteTrack tuned for broadcast soccer: longer occlusion memory so players
+# who cross or get blocked keep their ID, and stricter new-track creation so
+# crowd flickers don't spawn IDs.
+tracker_type: bytetrack
+track_high_thresh: 0.45   # first-pass association threshold
+track_low_thresh: 0.10    # second-pass (ByteTrack's low-conf rescue)
+new_track_thresh: 0.60    # detections must be confident to start a NEW track
+track_buffer: 90          # keep lost tracks alive for 3s @ 30fps
+match_thresh: 0.85        # IoU match tolerance
+fuse_score: True

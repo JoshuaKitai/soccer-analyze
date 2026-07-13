@@ -20,8 +20,16 @@ import numpy as np
 from .tracking import TrackData
 
 # --- tunable thresholds (normalized units) ---
-POSSESSION_RADIUS = 0.06      # max ball<->player distance to count as control
-MIN_SPELL_FRAMES = 5          # ignore sub-1/6s possession blips
+# Possession radius scales with how large the player appears on screen:
+# radius = POSSESSION_H_FACTOR * bbox_height, clamped. A player ~1.8m tall
+# controlling a ball within ~1m maps to roughly 0.55x their height.
+POSSESSION_H_FACTOR = 0.55
+POSSESSION_R_MIN = 0.02
+POSSESSION_R_MAX = 0.12
+HYSTERESIS_KEEP = 1.35        # current owner keeps the ball within 1.35x radius
+HYSTERESIS_STEAL = 0.65      # ...unless someone else is decisively closer
+MIN_SPELL_FRAMES = 4          # ignore sub-1/7s possession blips
+SPELL_MERGE_GAP_S = 0.35      # rejoin same-player spells split by blind frames
 PASS_MAX_GAP_S = 1.5          # ball in flight longer than this isn't a pass
 PASS_MIN_DIST = 0.04          # tiny position changes aren't passes
 DRIBBLE_MIN_S = 0.8           # carry must last this long
@@ -88,7 +96,8 @@ def nearest_opponent_dist(tracks: TrackData, frame: int, player: int) -> float:
         return np.nan
     best = np.inf
     for tid, arr in tracks.players.items():
-        if tid == player or tracks.teams.get(tid, -1) == team:
+        other = tracks.teams.get(tid, -1)
+        if tid == player or other == team or other == -1:   # skip teammates + refs
             continue
         q = arr[frame]
         if np.isnan(q[0]):
@@ -97,23 +106,51 @@ def nearest_opponent_dist(tracks: TrackData, frame: int, player: int) -> float:
     return best if np.isfinite(best) else np.nan
 
 
+def _possession_radius(tracks: TrackData, tid: int, frame: int) -> float:
+    h = tracks.height_at(tid, frame)
+    return float(np.clip(POSSESSION_H_FACTOR * h, POSSESSION_R_MIN, POSSESSION_R_MAX))
+
+
 def _possession_per_frame(tracks: TrackData) -> np.ndarray:
-    """Per-frame owning player id, or -1. Nearest player within radius."""
+    """Per-frame owning player id, or -1.
+
+    A player qualifies when the ball is within a radius scaled to their
+    on-screen size (so a zoomed-out broadcast doesn't demand impossible
+    closeness). Hysteresis keeps possession stable: the current owner holds
+    the ball while it stays near them, unless another player gets decisively
+    closer.
+    """
     n = tracks.n_frames
     owner = np.full(n, -1, dtype=int)
+    prev = -1
     for i in range(n):
         b = tracks.ball[i]
         if np.isnan(b[0]):
+            prev = -1
             continue
-        best_d, best_t = POSSESSION_RADIUS, -1
+        # ratio = distance / that player's own possession radius
+        ratios: dict[int, float] = {}
         for tid, arr in tracks.players.items():
             p = arr[i]
             if np.isnan(p[0]):
                 continue
-            d = float(np.linalg.norm(b - p))
-            if d < best_d:
-                best_d, best_t = d, tid
-        owner[i] = best_t
+            r = _possession_radius(tracks, tid, i)
+            ratios[tid] = float(np.linalg.norm(b - p)) / r
+        if not ratios:
+            prev = -1
+            continue
+        best_t = min(ratios, key=ratios.get)
+        best = ratios[best_t]
+        chosen = -1
+        if prev in ratios and ratios[prev] <= HYSTERESIS_KEEP:
+            # incumbent keeps it unless someone is decisively closer
+            chosen = prev
+            if best_t != prev and best <= HYSTERESIS_STEAL * ratios[prev] and best <= 1.0:
+                chosen = best_t
+        elif best <= 1.0:
+            chosen = best_t
+        owner[i] = chosen
+        prev = chosen
     return owner
 
 
@@ -127,7 +164,15 @@ def _spells(owner: np.ndarray, tracks: TrackData) -> list[Spell]:
                                     team=tracks.teams.get(int(owner[start]), -1),
                                     start=start, end=i - 1))
             start = i
-    return spells
+    # rejoin spells of the same player split by short blind gaps
+    merge_gap = int(SPELL_MERGE_GAP_S * tracks.fps)
+    merged: list[Spell] = []
+    for s in spells:
+        if merged and merged[-1].player == s.player and s.start - merged[-1].end <= merge_gap:
+            merged[-1].end = s.end
+        else:
+            merged.append(s)
+    return merged
 
 
 def extract_events(tracks: TrackData) -> Events:
@@ -185,8 +230,11 @@ def extract_events(tracks: TrackData) -> Events:
                                 mean_pressure=float(np.mean(pressures)) if pressures else 1.0,
                                 direction_changes=turns))
 
-    # --- shots: fast release out of a spell toward a lateral edge ---
-    for s in spells:
+    # --- shots: fast release where possession never resumes ---
+    # (an edge-of-frame heading requirement fails on broadcast footage because
+    # the camera pans with the ball; "released hard and nobody controls it
+    # again" is camera-proof)
+    for k, s in enumerate(spells):
         f0 = s.end
         window = ball_speed[f0:min(f0 + int(0.5 * fps), tracks.n_frames)]
         if len(window) == 0 or np.all(np.isnan(window)):
@@ -194,25 +242,27 @@ def extract_events(tracks: TrackData) -> Events:
         peak = float(np.nanmax(window))
         if peak < SHOT_SPEED:
             continue
-        # heading: where does the ball end up shortly after release?
+        next_start = spells[k + 1].start if k + 1 < len(spells) else np.inf
+        dead_time_s = (next_start - f0) / fps
         f1 = min(f0 + int(0.6 * fps), tracks.n_frames - 1)
         end_x = tracks.ball[f1][0]
-        if np.isnan(end_x):
+        toward_edge = (not np.isnan(end_x)
+                       and (end_x > 1 - SHOT_EDGE_ZONE or end_x < SHOT_EDGE_ZONE))
+        if not (dead_time_s > 1.0 or toward_edge):
             continue
-        if end_x > 1 - SHOT_EDGE_ZONE or end_x < SHOT_EDGE_ZONE:
-            release = tracks.players[s.player][f0]
-            defenders = 0
-            for tid, arr in tracks.players.items():
-                if tracks.teams.get(tid, -1) in (-1, s.team):
-                    continue
-                q = arr[f0]
-                if np.isnan(q[0]):
-                    continue
-                same_side = (q[0] > release[0]) == (end_x > release[0])
-                if same_side:
-                    defenders += 1
-            shots.append(Shot(player=s.player, team=s.team, frame=f0,
-                              ball_speed=peak, defenders_ahead=defenders))
+        release = tracks.players[s.player][f0]
+        shot_dir_x = (end_x - release[0]) if not np.isnan(end_x) else 0.0
+        defenders = 0
+        for tid, arr in tracks.players.items():
+            if tracks.teams.get(tid, -1) in (-1, s.team):
+                continue
+            q = arr[f0]
+            if np.isnan(q[0]) or np.isnan(release[0]):
+                continue
+            if (q[0] - release[0]) * shot_dir_x > 0:   # between shooter and target side
+                defenders += 1
+        shots.append(Shot(player=s.player, team=s.team, frame=f0,
+                          ball_speed=peak, defenders_ahead=defenders))
 
     team_frames = np.array([tracks.teams.get(int(o), -1) if o != -1 else -1 for o in owner])
     return Events(spells=spells, passes=passes, dribbles=dribbles,
