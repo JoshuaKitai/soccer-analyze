@@ -184,13 +184,14 @@ def debug_ball_video(video_path: str, tracks: TrackData, out_path: str) -> None:
 
     import cv2
 
-    from .tracking import _remove_static_candidates
+    from .tracking import _remove_official_zone_candidates, _remove_static_candidates
 
     if tracks.ball_candidates is None:
         raise ValueError("no cached ball candidates — re-run tracking first")
 
     raw = tracks.ball_candidates
     kept = _remove_static_candidates(raw, tracks.cam_affines, tracks.fps)
+    kept = _remove_official_zone_candidates(kept, tracks.boxes, tracks.teams)
     kept_sets = [{(round(x, 4), round(y, 4)) for (x, y, _) in cands} for cands in kept]
 
     cap = cv2.VideoCapture(video_path)
