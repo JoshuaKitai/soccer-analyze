@@ -19,29 +19,49 @@ RESULTS = ROOT / "results"
 
 
 def analyze_clip(video_path: str | None, name: str, use_vlm: bool = False,
-                 log: Callable[[str], None] = print) -> dict:
+                 log: Callable[[str], None] = print,
+                 reuse_tracks: bool = False) -> dict:
     """Analyze one clip (or the synthetic demo when video_path is None).
 
     Returns the report dict; writes report.json, play_data.json,
     dashboard.html, play_3d.html, annotated.mp4 (for real clips), and updates
     the cross-play gallery.
+
+    reuse_tracks: skip the (slow) detection passes and load results/<name>/
+    tracks.pkl from a previous run — for iterating on event/scoring logic.
     """
+    import pickle
+
     from .events import extract_events
     from .features import compute_features
     from .scoring import score_play, fuse_with_vlm
 
     out_dir = RESULTS / name
     out_dir.mkdir(parents=True, exist_ok=True)
+    tracks_pkl = out_dir / "tracks.pkl"
 
     # 1. track
     if video_path is None:
         from .tracking import synthetic_demo_tracks
         log("[1/5] generating synthetic demo play (no video)...")
         tracks = synthetic_demo_tracks()
+    elif reuse_tracks and tracks_pkl.exists():
+        log(f"[1/5] reusing cached tracks from {tracks_pkl}")
+        with open(tracks_pkl, "rb") as f:
+            tracks = pickle.load(f)
+        # detections are cached raw, so the (cheap) ball-linking step re-runs
+        # with the current algorithm — linking tweaks don't need re-detection
+        if getattr(tracks, "ball_candidates", None) is not None:
+            from .tracking import _link_ball
+            tracks.ball = _link_ball(tracks.ball_candidates, tracks.n_frames,
+                                     tracks.players, tracks.fps,
+                                     tracks.cam_affines)
     else:
         from .tracking import track_video
         log(f"[1/5] tracking players and ball in {video_path} (CPU, a few min)...")
         tracks = track_video(video_path, progress=False)
+        with open(tracks_pkl, "wb") as f:
+            pickle.dump(tracks, f)
     log(f"      {tracks.n_frames} frames @ {tracks.fps:.0f}fps, "
         f"{len(tracks.players)} tracked players")
 

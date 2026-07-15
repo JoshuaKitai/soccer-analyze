@@ -167,13 +167,21 @@ def _reencode_h264(src: str, dst: str) -> None:
         check=True, capture_output=True)
 
 
-def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) -> None:
-    """Write a browser-playable copy of the clip with the full tracking overlay:
+# overlay colors: everything is relative to WHO HAS THE BALL
+CARRIER_C = "#2a78d6"     # blue: the player in possession
+TEAMMATE_C = "#008300"    # green: their teammates
+OPPONENT_C = "#e34948"    # red: the opposing team
+OFFICIAL_C = "#eda100"    # yellow: referees / officials
 
-    - players marked with team-colored ground ellipses + IDs
-    - the ball carrier highlighted with a bright double ring
+
+def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) -> None:
+    """Write a browser-playable copy of the clip with the tracking overlay:
+
+    - bounding rectangles around every tracked person, colored by role
+      relative to possession: BLUE = on the ball, GREEN = the carrier's
+      teammates, RED = opponents, YELLOW = officials
     - the ball with a fading trail
-    - a HUD strip showing time and which team has possession
+    - a HUD strip with the clock, possession state, and the color legend
     - event flashes (PASS / DRIBBLE / SHOT) as they happen
     """
     import os
@@ -181,7 +189,10 @@ def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) ->
 
     import cv2
 
-    colors = {0: _hex2bgr(TEAM_A), 1: _hex2bgr(TEAM_B), -1: _hex2bgr(MUTED)}
+    carrier_c = _hex2bgr(CARRIER_C)
+    mate_c = _hex2bgr(TEAMMATE_C)
+    opp_c = _hex2bgr(OPPONENT_C)
+    ref_c = _hex2bgr(OFFICIAL_C)
     ball_c = _hex2bgr(BALL)
     white = (255, 255, 255)
     fps = tracks.fps
@@ -198,30 +209,45 @@ def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) ->
     tmp = tempfile.mktemp(suffix=".mp4")
     writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
     owner = events.owner_frames
-    team_frames = events.possessing_team_frames
 
+    poss_team = -1   # last team known to be in possession
     i = 0
     while i < tracks.n_frames:
         ok, frame = cap.read()
         if not ok:
             break
 
-        # players
         carrier = int(owner[i]) if owner[i] != -1 else None
+        if carrier is not None:
+            t = tracks.teams.get(carrier, -1)
+            if t != -1:
+                poss_team = t
+
+        # players: rectangles colored by role relative to possession
         for tid, arr in tracks.players.items():
             p = arr[i]
             if np.isnan(p[0]):
                 continue
-            c = colors[tracks.teams.get(tid, -1)]
-            pt = (int(p[0] * w), int(p[1] * h))
-            cv2.ellipse(frame, pt, (20, 8), 0, -35, 235, c, 3)
-            cv2.putText(frame, str(tid), (pt[0] - 7, pt[1] - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 3)
-            cv2.putText(frame, str(tid), (pt[0] - 7, pt[1] - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
-            if tid == carrier:  # highlight the player on the ball
-                cv2.ellipse(frame, pt, (28, 12), 0, 0, 360, white, 2)
-                cv2.ellipse(frame, pt, (32, 14), 0, 0, 360, ball_c, 2)
+            team = tracks.teams.get(tid, -1)
+            if tid == carrier:
+                c, thick = carrier_c, 3
+            elif team == -1:
+                c, thick = ref_c, 2
+            elif poss_team == -1 or team == poss_team:
+                c, thick = mate_c, 2
+            else:
+                c, thick = opp_c, 2
+            if tracks.boxes is not None and tid in tracks.boxes \
+                    and not np.isnan(tracks.boxes[tid][i][0]):
+                x1, y1, x2, y2 = tracks.boxes[tid][i]
+                cv2.rectangle(frame, (int(x1 * w), int(y1 * h)),
+                              (int(x2 * w), int(y2 * h)), c, thick)
+            else:   # fallback: box built from ground point + height
+                bh = tracks.height_at(tid, i) * h
+                bw = 0.4 * bh
+                cx, gy = p[0] * w, p[1] * h
+                cv2.rectangle(frame, (int(cx - bw / 2), int(gy - bh)),
+                              (int(cx + bw / 2), int(gy)), c, thick)
 
         # ball trail (last ~0.7 s), fading
         trail = tracks.ball[max(0, i - int(0.7 * fps)):i + 1]
@@ -236,17 +262,23 @@ def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) ->
             cv2.circle(frame, bp, 7, ball_c, -1)
             cv2.circle(frame, bp, 9, white, 1)
 
-        # HUD: time + possession chip
+        # HUD: clock + possession + legend
         cv2.rectangle(frame, (0, 0), (w, 34), (20, 20, 20), -1)
         cv2.putText(frame, f"t={i / fps:5.1f}s", (12, 23),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, white, 1)
-        pt_team = int(team_frames[i])
-        label = {0: "TEAM A", 1: "TEAM B", -1: "CONTESTED"}[pt_team if pt_team in (0, 1) else -1]
-        chip = colors.get(pt_team, colors[-1])
-        cv2.circle(frame, (150, 17), 8, chip, -1)
-        cv2.putText(frame, f"possession: {label}", (168, 23),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, white, 1)
-
+        state = "ball carrier" if carrier is not None else "contested"
+        cv2.circle(frame, (150, 17), 8, carrier_c if carrier is not None else (90, 90, 90), -1)
+        cv2.putText(frame, state, (166, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, white, 1)
+        legend = [("has ball", carrier_c), ("teammate", mate_c),
+                  ("opponent", opp_c), ("official", ref_c)]
+        x = w - 12
+        for label, c in reversed(legend):
+            size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            x -= size[0]
+            cv2.putText(frame, label, (x, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 1)
+            x -= 18
+            cv2.rectangle(frame, (x, 9), (x + 12, 25), c, -1)
+            x -= 14
         # event flash
         for f0, text in flashes:
             if f0 <= i < f0 + flash_len:

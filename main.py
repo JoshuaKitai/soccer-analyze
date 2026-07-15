@@ -27,13 +27,16 @@ def main() -> None:
     ap.add_argument("--demo", action="store_true", help="run on a synthetic play, no video needed")
     ap.add_argument("--vlm", action="store_true", help="add VLM vision analysis (needs ANTHROPIC_API_KEY)")
     ap.add_argument("--name", help="play name for reports (default: video filename)")
+    ap.add_argument("--reuse-tracks", action="store_true",
+                    help="skip detection and reuse cached tracks.pkl (fast iteration on event/scoring logic)")
     args = ap.parse_args()
 
     if not args.demo and not args.video:
         ap.error("provide a video path or --demo")
 
     name = args.name or (Path(args.video).stem if args.video else "demo_play")
-    report = analyze_clip(args.video if not args.demo else None, name, args.vlm)
+    report = analyze_clip(args.video if not args.demo else None, name, args.vlm,
+                          reuse_tracks=args.reuse_tracks)
 
     print("\n" + "=" * 46)
     print(f"  PLAY DIFFICULTY: {report['score']:.0f} / 100")

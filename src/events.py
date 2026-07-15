@@ -35,6 +35,13 @@ MIN_SPELL_FRAMES = 4          # ignore sub-1/7s possession blips
 SPELL_MERGE_GAP_S = 0.35      # rejoin same-player spells split by blind frames
 PASS_MAX_GAP_S = 1.5          # ball in flight longer than this isn't a pass
 PASS_MIN_DIST = 0.04          # tiny position changes aren't passes
+PASS_MIN_FLIGHT = 0.30        # the ball must actually FLY between owners —
+                              # a carried ball moves at ~0.1-0.2; without this,
+                              # a track-ID switch on the dribbler reads as a
+                              # "pass" between two phantom players
+PASS_FLIGHT_FACTOR = 1.8      # ...and fly much faster than the giver was
+                              # running: a sprint knock-on only slightly
+                              # outpaces the sprinter, a real pass doesn't
 DRIBBLE_MIN_S = 0.8           # carry must last this long
 DRIBBLE_MIN_TRAVEL = 0.05     # and cover this much ground
 SHOT_SPEED = 0.45             # normalized units/sec — very fast release
@@ -220,6 +227,12 @@ def extract_events(tracks: TrackData) -> Events:
             continue
         flight = ball_speed[a.end:b.start + 1]
         peak = float(np.nanmax(flight)) if len(flight) and not np.all(np.isnan(flight)) else 0.0
+        giver_sp = tracks.player_speed(a.player)[max(a.end - 3, 0):a.end + 1]
+        giver_sp = giver_sp[~np.isnan(giver_sp)]
+        giver_speed = float(np.median(giver_sp)) if len(giver_sp) else 0.0
+        if peak < max(PASS_MIN_FLIGHT, PASS_FLIGHT_FACTOR * giver_speed):
+            continue    # ball never outran the carrier: an ID switch or a
+                        # dribble knock-on, not a pass
         pressure = nearest_opponent_dist(tracks, b.start, b.player)
         passes.append(Pass(frm=a.player, to=b.player, team=a.team,
                            start=a.end, end=b.start, distance=dist,
@@ -255,8 +268,11 @@ def extract_events(tracks: TrackData) -> Events:
     # (an edge-of-frame heading requirement fails on broadcast footage because
     # the camera pans with the ball; "released hard and nobody controls it
     # again" is camera-proof)
+    pass_release_frames = {p.start for p in passes}
     for k, s in enumerate(spells):
         f0 = s.end
+        if f0 in pass_release_frames:
+            continue    # this release already resolved into a completed pass
         window = ball_speed[f0:min(f0 + int(0.5 * fps), tracks.n_frames)]
         if len(window) == 0 or np.all(np.isnan(window)):
             continue

@@ -56,6 +56,15 @@ BALL_STEP_ALLOW = 0.045    # allowed travel per frame of gap before penalty
 BALL_STEP_BASE = 0.035     # slack at zero gap
 BALL_TELEPORT_COST = 9.0   # cost cap: re-acquiring far away is possible but dear
 BALL_GAP_COST = 0.15       # per skipped frame
+BALL_MAX_SPEED = 2.5       # units/s — faster than any real ball flight; jumps
+                           # implying more are physically impossible and FORBIDDEN
+                           # unless the ball has been unseen long enough
+BALL_TELEPORT_MIN_GAP = 10 # frames of blindness before a re-acquisition jump
+                           # may ignore the physics ceiling
+STATIC_SPAN_S = 2.5        # a "ball" parked at the same pitch position this long
+STATIC_TOL = 0.035         # (within this radius, camera-compensated) is a pitch
+                           # marking — penalty spot, center spot — not the ball
+STATIC_MIN_HITS = 12       # ...if it was detected at least this many times
 BALL_CONF_W = 3.0          # weight of detection confidence
 BALL_PROX_NEAR = 0.15      # full proximity bonus inside this player distance
 BALL_PROX_FAR = 0.30       # beyond this from every player: penalized (penalty
@@ -75,6 +84,10 @@ class TrackData:
     heights: dict[int, np.ndarray] | None = None    # tid -> (n,) bbox heights
     cam_affines: np.ndarray | None = None           # (n, 2, 3) frame i-1 -> i
     colors: dict[int, np.ndarray] | None = None     # tid -> mean jersey BGR
+    boxes: dict[int, np.ndarray] | None = None      # tid -> (n, 4) xyxy normalized
+    ball_candidates: list | None = None             # per-frame raw ball detections
+                                                    # (kept so linking can be re-run
+                                                    # from cache without re-detecting)
 
     def ball_speed(self) -> np.ndarray:
         return self._speed(self.ball)
@@ -188,8 +201,61 @@ def _camera_motion(prev_gray, gray, boxes_px, w, h):
     return _pixel_affine_to_norm(A_px, w, h)
 
 
+def _remove_static_candidates(candidates: list[list[tuple[float, float, float]]],
+                              cam_affines: np.ndarray | None,
+                              fps: float) -> list[list[tuple[float, float, float]]]:
+    """Drop ball detections that are static in pitch coordinates.
+
+    Pitch markings (penalty spot, center spot) look exactly like a ball to the
+    detector but never move relative to the pitch. Candidates are mapped into
+    a camera-stabilized reference frame; any spot that keeps producing
+    detections at the same stabilized position for STATIC_SPAN_S seconds is a
+    marking, and every candidate near it is removed.
+    """
+    from collections import defaultdict
+
+    n = len(candidates)
+    # cumulative transforms: frame f coords -> frame 0 coords
+    C = [np.eye(3)]
+    for f in range(1, n):
+        A = np.eye(3)
+        if cam_affines is not None:
+            A[:2] = cam_affines[f]
+        # invert (frame f-1 -> f) and compose onto the running transform
+        C.append(C[f - 1] @ np.linalg.inv(A))
+
+    stab: list[tuple[int, int, float, float]] = []   # frame, idx, sx, sy
+    for f, cands in enumerate(candidates):
+        for idx, (x, y, _conf) in enumerate(cands):
+            s = C[f] @ np.array([x, y, 1.0])
+            stab.append((f, idx, float(s[0]), float(s[1])))
+
+    grid: dict[tuple[int, int], list[tuple[int, int, float, float]]] = defaultdict(list)
+    cell = STATIC_TOL
+    for item in stab:
+        grid[(round(item[2] / cell), round(item[3] / cell))].append(item)
+
+    static: set[tuple[int, int]] = set()
+    for items in grid.values():
+        if len(items) < STATIC_MIN_HITS:
+            continue
+        frames = [it[0] for it in items]
+        if (max(frames) - min(frames)) / fps < STATIC_SPAN_S:
+            continue
+        xs = np.array([it[2] for it in items])
+        ys = np.array([it[3] for it in items])
+        if xs.std() < STATIC_TOL and ys.std() < STATIC_TOL:
+            static.update((it[0], it[1]) for it in items)
+
+    if not static:
+        return candidates
+    return [[c for idx, c in enumerate(cands) if (f, idx) not in static]
+            for f, cands in enumerate(candidates)]
+
+
 def _link_ball(candidates: list[list[tuple[float, float, float]]],
-               n: int, players: dict[int, np.ndarray]) -> np.ndarray:
+               n: int, players: dict[int, np.ndarray], fps: float,
+               cam_affines: np.ndarray | None = None) -> np.ndarray:
     """Choose the ball trajectory by global path optimization.
 
     Every detection becomes a node scored by confidence and proximity to a
@@ -200,6 +266,7 @@ def _link_ball(candidates: list[list[tuple[float, float, float]]],
     Unlike greedy frame-by-frame linking, one bad detection can't hijack the
     track: committing to it has to beat every alternative path.
     """
+    candidates = _remove_static_candidates(candidates, cam_affines, fps)
     nodes: list[tuple[int, float, float, float]] = []   # frame, x, y, conf
     for f, cands in enumerate(candidates):
         for (x, y, conf) in cands:
@@ -235,6 +302,10 @@ def _link_ball(candidates: list[list[tuple[float, float, float]]],
                 break
             if gap >= 1:
                 dist = float(np.hypot(xi - xj, yi - yj))
+                speed = dist * fps / gap
+                if speed > BALL_MAX_SPEED and gap < BALL_TELEPORT_MIN_GAP:
+                    j -= 1
+                    continue    # physically impossible jump: no such edge
                 allowed = BALL_STEP_BASE + BALL_STEP_ALLOW * gap
                 penalty = min(3.0 * (dist / allowed) ** 2, BALL_TELEPORT_COST)
                 penalty += BALL_GAP_COST * (gap - 1)
@@ -250,13 +321,25 @@ def _link_ball(candidates: list[list[tuple[float, float, float]]],
         f, x, y, _ = nodes[i]
         pos[f] = (x, y)
         i = parent[i]
-    return _interpolate_gaps(pos, max_gap=15)
+
+    pos = _interpolate_gaps(pos, max_gap=15)
+
+    # sanity sweep: delete any residual physically-impossible motion
+    # (e.g. interpolation across a legitimate long-gap re-acquisition)
+    for i in range(1, n):
+        p0, p1 = pos[i - 1], pos[i]
+        if np.isnan(p0[0]) or np.isnan(p1[0]):
+            continue
+        if float(np.linalg.norm(p1 - p0)) * fps > 1.2 * BALL_MAX_SPEED:
+            pos[i] = np.nan
+    return pos
 
 
 def _stitch_tracks(players: dict[int, np.ndarray],
                    heights: dict[int, np.ndarray],
                    colors: dict[int, np.ndarray],
-                   fps: float) -> tuple[dict, dict, dict]:
+                   boxes: dict[int, np.ndarray],
+                   fps: float) -> tuple[dict, dict, dict, dict]:
     """Merge track fragments belonging to the same player.
 
     Two fragments merge when one ends shortly before the other starts, the
@@ -297,13 +380,15 @@ def _stitch_tracks(players: dict[int, np.ndarray],
                 players[a][keep] = players[b][keep]
                 hk = ~np.isnan(heights[b])
                 heights[a][hk] = heights[b][hk]
+                bk = ~np.isnan(boxes[b][:, 0])
+                boxes[a][bk] = boxes[b][bk]
                 if a in colors and b in colors:
                     colors[a] = (colors[a] + colors[b]) / 2
-                del players[b], heights[b]
+                del players[b], heights[b], boxes[b]
                 colors.pop(b, None)
                 merged = True
                 break
-    return players, heights, colors
+    return players, heights, colors, boxes
 
 
 # ------------------------------------------------------------------ main API
@@ -341,7 +426,7 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
         rA = player_yolo.track(frame, persist=True, conf=PLAYER_CONF, classes=[0],
                                imgsz=PLAYER_IMGSZ, tracker=_TRACKER_YAML,
                                verbose=False)[0]
-        players_here: dict[int, tuple[float, float, float]] = {}
+        players_here: dict[int, tuple] = {}
         boxes_px = []
         bA = rA.boxes
         if bA is not None and len(bA) > 0 and bA.id is not None:
@@ -350,7 +435,8 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
             for box, tid in zip(xyxy, ids):
                 x1, y1, x2, y2 = box
                 boxes_px.append(box)
-                players_here[int(tid)] = ((x1 + x2) / 2 / w, y2 / h, (y2 - y1) / h)
+                players_here[int(tid)] = ((x1 + x2) / 2 / w, y2 / h, (y2 - y1) / h,
+                                          x1 / w, y1 / h, x2 / w, y2 / h)
                 if i % 2 == 0:  # jersey sample every other frame
                     cy1 = int(y1 + 0.15 * (y2 - y1))
                     cy2 = int(y1 + 0.50 * (y2 - y1))
@@ -395,31 +481,37 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
     all_ids = sorted({tid for f in frames_players for tid in f})
     players: dict[int, np.ndarray] = {}
     heights: dict[int, np.ndarray] = {}
+    boxes: dict[int, np.ndarray] = {}
     for tid in all_ids:
         arr = np.full((n, 2), np.nan)
         hgt = np.full(n, np.nan)
+        bxs = np.full((n, 4), np.nan)
         for f, d in enumerate(frames_players):
             if tid in d:
                 arr[f] = d[tid][:2]
                 hgt[f] = d[tid][2]
+                bxs[f] = d[tid][3:7]
         vis = (~np.isnan(arr[:, 0])).sum()
         med_h = float(np.nanmedian(hgt)) if vis else 0.0
         if vis < fps * MIN_TRACK_S or not (MIN_MEDIAN_H <= med_h <= MAX_MEDIAN_H):
             continue
         players[tid] = arr
         heights[tid] = hgt
+        boxes[tid] = bxs
 
     colors = {t: np.mean(jersey_colors[t], axis=0)
               for t in players if t in jersey_colors}
-    players, heights, colors = _stitch_tracks(players, heights, colors, fps)
+    players, heights, colors, boxes = _stitch_tracks(players, heights, colors, boxes, fps)
 
     # smooth small holes left by occlusion
     for tid in players:
         players[tid] = _interpolate_gaps(players[tid], max_gap=10)
         heights[tid] = _interpolate_gaps(heights[tid], max_gap=10)
+        boxes[tid] = _interpolate_gaps(boxes[tid], max_gap=10)
 
     # ball trajectory: global path optimization, informed by player positions
-    ball = _link_ball(ball_candidates, n, players)
+    affines_np = np.array(affines)
+    ball = _link_ball(ball_candidates, n, players, fps, affines_np)
 
     # team assignment with referee/keeper rejection: a track is exiled to -1
     # when its kit color fits neither cluster (relative to the inter-kit
@@ -447,8 +539,8 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
 
     return TrackData(fps=fps, n_frames=n, ball=ball, players=players,
                      teams=teams, frame_size=(w, h),
-                     heights=heights, cam_affines=np.array(affines),
-                     colors=colors)
+                     heights=heights, cam_affines=affines_np,
+                     colors=colors, boxes=boxes, ball_candidates=ball_candidates)
 
 
 def synthetic_demo_tracks(seed: int = 7) -> TrackData:
@@ -500,7 +592,12 @@ def synthetic_demo_tracks(seed: int = 7) -> TrackData:
     ball = noisy(ball, 0.003)
 
     heights = {tid: np.full(n, 0.12) for tid in players}
+    boxes = {}
+    for tid, arr in players.items():
+        half_w = 0.5 * 0.4 * 0.12   # box width ~40% of height
+        boxes[tid] = np.stack([arr[:, 0] - half_w, arr[:, 1] - 0.12,
+                               arr[:, 0] + half_w, arr[:, 1]], axis=1)
     affines = np.tile(_IDENTITY, (n, 1, 1))
     return TrackData(fps=fps, n_frames=n, ball=ball, players=players,
                      teams=teams, frame_size=(1280, 720),
-                     heights=heights, cam_affines=affines)
+                     heights=heights, cam_affines=affines, boxes=boxes)
