@@ -312,10 +312,47 @@ def _remove_static_candidates(candidates: list[list[tuple[float, float, float]]]
             for f, cands in enumerate(candidates)]
 
 
+def _remove_official_zone_candidates(
+        candidates: list[list[tuple[float, float, float]]],
+        boxes: dict[int, np.ndarray] | None,
+        teams: dict[int, int] | None) -> list[list[tuple[float, float, float]]]:
+    """Drop ball candidates inside an official's (expanded) bounding box.
+
+    The assistant referee's flag is a small bright object that the detector
+    confuses with the ball — but it lives in the referee's hands. The real
+    match ball is never inside an official's silhouette, so any candidate
+    overlapping an official's box (padded for the flag's reach) is removed.
+    """
+    if boxes is None or teams is None:
+        return candidates
+    official_ids = [t for t, team in teams.items() if team == -1 and t in boxes]
+    if not official_ids:
+        return candidates
+    out = []
+    for f, cands in enumerate(candidates):
+        keep = []
+        for (x, y, conf) in cands:
+            inside = False
+            for tid in official_ids:
+                bx = boxes[tid][f]
+                if np.isnan(bx[0]):
+                    continue
+                x1, y1, x2, y2 = bx
+                pw, ph = 0.6 * (x2 - x1), 0.2 * (y2 - y1)   # flag reach padding
+                if x1 - pw <= x <= x2 + pw and y1 - ph <= y <= y2 + ph:
+                    inside = True
+                    break
+            if not inside:
+                keep.append((x, y, conf))
+        out.append(keep)
+    return out
+
+
 def _link_ball(candidates: list[list[tuple[float, float, float]]],
                n: int, players: dict[int, np.ndarray], fps: float,
                cam_affines: np.ndarray | None = None,
-               teams: dict[int, int] | None = None) -> np.ndarray:
+               teams: dict[int, int] | None = None,
+               boxes: dict[int, np.ndarray] | None = None) -> np.ndarray:
     """Choose the ball trajectory by global path optimization.
 
     Every detection becomes a node scored by confidence and proximity to a
@@ -327,6 +364,7 @@ def _link_ball(candidates: list[list[tuple[float, float, float]]],
     track: committing to it has to beat every alternative path.
     """
     candidates = _remove_static_candidates(candidates, cam_affines, fps)
+    candidates = _remove_official_zone_candidates(candidates, boxes, teams)
     nodes: list[tuple[int, float, float, float]] = []   # frame, x, y, conf
     for f, cands in enumerate(candidates):
         for (x, y, conf) in cands:
@@ -582,7 +620,7 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
 
     # ball trajectory: global path optimization, informed by player positions
     affines_np = np.array(affines)
-    ball = _link_ball(ball_candidates, n, players, fps, affines_np, teams)
+    ball = _link_ball(ball_candidates, n, players, fps, affines_np, teams, boxes)
 
     return TrackData(fps=fps, n_frames=n, ball=ball, players=players,
                      teams=teams, frame_size=(w, h),

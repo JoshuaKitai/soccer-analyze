@@ -58,7 +58,8 @@ def analyze_clip(video_path: str | None, name: str, use_vlm: bool = False,
             from .tracking import _link_ball
             tracks.ball = _link_ball(tracks.ball_candidates, tracks.n_frames,
                                      tracks.players, tracks.fps,
-                                     tracks.cam_affines, tracks.teams)
+                                     tracks.cam_affines, tracks.teams,
+                                     tracks.boxes)
     else:
         from .tracking import track_video
         log(f"[1/5] tracking players and ball in {video_path} (CPU, a few min)...")
