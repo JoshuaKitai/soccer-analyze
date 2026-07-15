@@ -167,6 +167,139 @@ def _reencode_h264(src: str, dst: str) -> None:
         check=True, capture_output=True)
 
 
+def debug_ball_video(video_path: str, tracks: TrackData, out_path: str) -> None:
+    """Everything the ball detector sees, frame by frame:
+
+    - gray dots: raw detections suppressed as static pitch markings
+    - orange dots: live candidates (larger = more confident)
+    - green circle + trail: the trajectory the linker chose
+    - HUD: candidate count and whether the ball is currently tracked
+
+    Watch this to tell WHERE tracking fails: no orange dot on the real ball
+    means the detector can't see it (needs better weights); an orange dot
+    exists but green goes elsewhere means the linker chose wrong (tunable).
+    """
+    import os
+    import tempfile
+
+    import cv2
+
+    from .tracking import _remove_static_candidates
+
+    if tracks.ball_candidates is None:
+        raise ValueError("no cached ball candidates — re-run tracking first")
+
+    raw = tracks.ball_candidates
+    kept = _remove_static_candidates(raw, tracks.cam_affines, tracks.fps)
+    kept_sets = [{(round(x, 4), round(y, 4)) for (x, y, _) in cands} for cands in kept]
+
+    cap = cv2.VideoCapture(video_path)
+    w, h = tracks.frame_size
+    tmp = tempfile.mktemp(suffix=".mp4")
+    writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), tracks.fps, (w, h))
+    green = (80, 220, 80)
+    orange = (30, 140, 250)
+    gray = (150, 150, 150)
+    white = (255, 255, 255)
+
+    i = 0
+    while i < tracks.n_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for (x, y, conf) in raw[i]:
+            pt = (int(x * w), int(y * h))
+            if (round(x, 4), round(y, 4)) in kept_sets[i]:
+                r = 4 + int(8 * min(conf, 0.6))
+                cv2.circle(frame, pt, r, orange, 2)
+                cv2.putText(frame, f"{conf:.2f}", (pt[0] + 8, pt[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, orange, 1)
+            else:
+                cv2.line(frame, (pt[0] - 6, pt[1] - 6), (pt[0] + 6, pt[1] + 6), gray, 2)
+                cv2.line(frame, (pt[0] - 6, pt[1] + 6), (pt[0] + 6, pt[1] - 6), gray, 2)
+        # chosen trajectory: trail + current
+        trail = tracks.ball[max(0, i - int(0.7 * tracks.fps)):i + 1]
+        pts = [(int(p[0] * w), int(p[1] * h)) for p in trail if not np.isnan(p[0])]
+        for j in range(1, len(pts)):
+            cv2.line(frame, pts[j - 1], pts[j], green, 2)
+        b = tracks.ball[i]
+        tracked = not np.isnan(b[0])
+        if tracked:
+            cv2.circle(frame, (int(b[0] * w), int(b[1] * h)), 12, green, 2)
+        cv2.rectangle(frame, (0, 0), (w, 34), (20, 20, 20), -1)
+        cv2.putText(frame,
+                    f"t={i / tracks.fps:5.1f}s  candidates={len(raw[i])}  "
+                    f"ball={'TRACKED' if tracked else 'LOST'}",
+                    (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    green if tracked else (60, 60, 255), 1)
+        cv2.putText(frame, "orange=candidate  gray X=static-suppressed  green=chosen",
+                    (w - 560, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 1)
+        writer.write(frame)
+        i += 1
+    cap.release()
+    writer.release()
+    try:
+        _reencode_h264(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def debug_players_video(video_path: str, tracks: TrackData, out_path: str) -> None:
+    """Player tracking internals: every box with its track ID, team color,
+    and a swatch of the kit color the clustering saw. Use it to spot ID
+    switches and wrong team assignments."""
+    import os
+    import tempfile
+
+    import cv2
+
+    team_c = {0: _hex2bgr(TEAM_A), 1: _hex2bgr(TEAM_B), -1: _hex2bgr(OFFICIAL_C)}
+    white = (255, 255, 255)
+
+    cap = cv2.VideoCapture(video_path)
+    w, h = tracks.frame_size
+    tmp = tempfile.mktemp(suffix=".mp4")
+    writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), tracks.fps, (w, h))
+
+    i = 0
+    while i < tracks.n_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        for tid, arr in tracks.players.items():
+            if np.isnan(arr[i][0]):
+                continue
+            team = tracks.teams.get(tid, -1)
+            c = team_c[team]
+            if tracks.boxes is not None and tid in tracks.boxes \
+                    and not np.isnan(tracks.boxes[tid][i][0]):
+                x1, y1, x2, y2 = tracks.boxes[tid][i]
+                p1, p2 = (int(x1 * w), int(y1 * h)), (int(x2 * w), int(y2 * h))
+                cv2.rectangle(frame, p1, p2, c, 2)
+                label = f"{tid}" + ("R" if team == -1 else f"/{team}")
+                cv2.putText(frame, label, (p1[0], p1[1] - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, white, 3)
+                cv2.putText(frame, label, (p1[0], p1[1] - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
+                if tracks.colors is not None and tid in tracks.colors:
+                    kit = tuple(int(v) for v in tracks.colors[tid])
+                    cv2.rectangle(frame, (p2[0] - 12, p1[1]), (p2[0], p1[1] + 12), kit, -1)
+        cv2.rectangle(frame, (0, 0), (w, 34), (20, 20, 20), -1)
+        cv2.putText(frame, f"t={i / tracks.fps:5.1f}s  blue/red=teams yellow=official  "
+                    "id/team labels, kit swatch top-right of box",
+                    (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, white, 1)
+        writer.write(frame)
+        i += 1
+    cap.release()
+    writer.release()
+    try:
+        _reencode_h264(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 # overlay colors: everything is relative to WHO HAS THE BALL
 CARRIER_C = "#2a78d6"     # blue: the player in possession
 TEAMMATE_C = "#008300"    # green: their teammates

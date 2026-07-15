@@ -29,6 +29,9 @@ def main() -> None:
     ap.add_argument("--name", help="play name for reports (default: video filename)")
     ap.add_argument("--reuse-tracks", action="store_true",
                     help="skip detection and reuse cached tracks.pkl (fast iteration on event/scoring logic)")
+    ap.add_argument("--debug", action="store_true",
+                    help="also write debug_ball.mp4 (all detector candidates + chosen "
+                         "trajectory) and debug_players.mp4 (IDs, teams, kit colors)")
     args = ap.parse_args()
 
     if not args.demo and not args.video:
@@ -36,7 +39,7 @@ def main() -> None:
 
     name = args.name or (Path(args.video).stem if args.video else "demo_play")
     report = analyze_clip(args.video if not args.demo else None, name, args.vlm,
-                          reuse_tracks=args.reuse_tracks)
+                          reuse_tracks=args.reuse_tracks, debug=args.debug)
 
     print("\n" + "=" * 46)
     print(f"  PLAY DIFFICULTY: {report['score']:.0f} / 100")

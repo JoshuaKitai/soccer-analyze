@@ -147,17 +147,76 @@ def _interpolate_gaps(pos: np.ndarray, max_gap: int = 15) -> np.ndarray:
     return out.reshape(pos.shape)
 
 
-def _kmeans2(colors: np.ndarray, iters: int = 25, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def _kmeans(colors: np.ndarray, k: int = 2, iters: int = 25,
+            seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
-    centers = colors[rng.choice(len(colors), 2, replace=False)].astype(float)
+    centers = colors[rng.choice(len(colors), k, replace=False)].astype(float)
     labels = np.zeros(len(colors), dtype=int)
     for _ in range(iters):
         d = np.linalg.norm(colors[:, None, :] - centers[None, :, :], axis=2)
         labels = d.argmin(axis=1)
-        for k in range(2):
-            if (labels == k).any():
-                centers[k] = colors[labels == k].mean(axis=0)
+        for j in range(k):
+            if (labels == j).any():
+                centers[j] = colors[labels == j].mean(axis=0)
     return labels, centers
+
+
+def assign_teams(players: dict[int, np.ndarray],
+                 colors: dict[int, np.ndarray]) -> dict[int, int]:
+    """Team assignment from kit colors, with officials isolated.
+
+    First tries THREE clusters: referees wear their own kit, so when a small
+    third color group exists it's marked as officials (-1) and the two big
+    groups become the teams. Falls back to two clusters with distance-based
+    outlier rejection. Frame-border dwell (sideline officials) is applied by
+    the caller on top of this.
+    """
+    teams: dict[int, int] = {tid: -1 for tid in players}
+    tids = [t for t in players if t in colors]
+    if len(tids) < 2:
+        return teams
+    mat = np.array([colors[t] for t in tids])
+
+    if len(tids) >= 6:
+        labels3, centers3 = _kmeans(mat, k=3)
+        sizes = [int((labels3 == j).sum()) for j in range(3)]
+        smallest = int(np.argmin(sizes))
+        # a genuinely small third cluster (distinct kit) = the officials
+        if 0 < sizes[smallest] <= max(2, round(0.2 * len(tids))):
+            mains = [j for j in range(3) if j != smallest]
+            for t, lab in zip(tids, labels3):
+                teams[t] = -1 if lab == smallest else mains.index(lab)
+            return teams
+
+    labels, centers = _kmeans(mat, k=2)
+    sep = float(np.linalg.norm(centers[0] - centers[1]))
+    for t, lab in zip(tids, labels):
+        if sep > 1e-6 and np.linalg.norm(colors[t] - centers[lab]) > 1.0 * sep:
+            teams[t] = -1   # fits neither kit: referee or goalkeeper
+        else:
+            teams[t] = int(lab)
+    return teams
+
+
+def _mark_sideline_officials(players: dict[int, np.ndarray],
+                             teams: dict[int, int]) -> None:
+    """Tracks living on the frame border are sideline officials/coaches."""
+    for tid, arr in players.items():
+        v = arr[~np.isnan(arr[:, 0])]
+        if len(v) == 0:
+            continue
+        near_edge = ((v[:, 0] < 0.03) | (v[:, 0] > 0.97)
+                     | (v[:, 1] < 0.05) | (v[:, 1] > 0.95))
+        if near_edge.mean() > 0.8:
+            teams[tid] = -1
+
+
+def recompute_teams(tracks: "TrackData") -> None:
+    """Re-run team assignment on cached tracks (after algorithm changes)."""
+    if tracks.colors is None:
+        return
+    tracks.teams = assign_teams(tracks.players, tracks.colors)
+    _mark_sideline_officials(tracks.players, tracks.teams)
 
 
 def _pixel_affine_to_norm(A: np.ndarray, w: int, h: int) -> np.ndarray:
@@ -255,7 +314,8 @@ def _remove_static_candidates(candidates: list[list[tuple[float, float, float]]]
 
 def _link_ball(candidates: list[list[tuple[float, float, float]]],
                n: int, players: dict[int, np.ndarray], fps: float,
-               cam_affines: np.ndarray | None = None) -> np.ndarray:
+               cam_affines: np.ndarray | None = None,
+               teams: dict[int, int] | None = None) -> np.ndarray:
     """Choose the ball trajectory by global path optimization.
 
     Every detection becomes a node scored by confidence and proximity to a
@@ -276,8 +336,14 @@ def _link_ball(candidates: list[list[tuple[float, float, float]]],
         return pos
 
     def emission(f: int, x: float, y: float, conf: float) -> float:
+        # proximity counts TEAM players only: the real ball lives at a
+        # player's feet or in flight between players. Being near only an
+        # official is where false positives live (the ball is never "with"
+        # the referee), so officials give no bonus.
         dmin = np.inf
-        for arr in players.values():
+        for tid, arr in players.items():
+            if teams is not None and teams.get(tid, -1) == -1:
+                continue
             p = arr[f]
             if not np.isnan(p[0]):
                 dmin = min(dmin, float(np.hypot(x - p[0], y - p[1])))
@@ -509,33 +575,14 @@ def track_video(video_path: str, model_name: str = "yolov8n.pt",
         heights[tid] = _interpolate_gaps(heights[tid], max_gap=10)
         boxes[tid] = _interpolate_gaps(boxes[tid], max_gap=10)
 
+    # team assignment BEFORE ball linking, so linking can distrust candidates
+    # that are near only an official
+    teams = assign_teams(players, colors)
+    _mark_sideline_officials(players, teams)
+
     # ball trajectory: global path optimization, informed by player positions
     affines_np = np.array(affines)
-    ball = _link_ball(ball_candidates, n, players, fps, affines_np)
-
-    # team assignment with referee/keeper rejection: a track is exiled to -1
-    # when its kit color fits neither cluster (relative to the inter-kit
-    # distance) — or when it hugs the frame border for most of its life,
-    # which is the signature of assistant referees, coaches, and ball kids.
-    teams: dict[int, int] = {tid: -1 for tid in players}
-    tids_c = [t for t in players if t in colors]
-    if len(tids_c) >= 2:
-        mat = np.array([colors[t] for t in tids_c])
-        labels, centers = _kmeans2(mat)
-        sep = float(np.linalg.norm(centers[0] - centers[1]))
-        for t, lab in zip(tids_c, labels):
-            if sep > 1e-6 and np.linalg.norm(colors[t] - centers[lab]) > 1.0 * sep:
-                teams[t] = -1   # far outside both kits: referee or goalkeeper
-            else:
-                teams[t] = int(lab)
-    for tid, arr in players.items():
-        v = arr[~np.isnan(arr[:, 0])]
-        if len(v) == 0:
-            continue
-        near_edge = ((v[:, 0] < 0.03) | (v[:, 0] > 0.97)
-                     | (v[:, 1] < 0.05) | (v[:, 1] > 0.95))
-        if near_edge.mean() > 0.8:
-            teams[tid] = -1     # lives on the frame border: sideline official
+    ball = _link_ball(ball_candidates, n, players, fps, affines_np, teams)
 
     return TrackData(fps=fps, n_frames=n, ball=ball, players=players,
                      teams=teams, frame_size=(w, h),

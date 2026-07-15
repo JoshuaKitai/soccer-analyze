@@ -20,7 +20,7 @@ RESULTS = ROOT / "results"
 
 def analyze_clip(video_path: str | None, name: str, use_vlm: bool = False,
                  log: Callable[[str], None] = print,
-                 reuse_tracks: bool = False) -> dict:
+                 reuse_tracks: bool = False, debug: bool = False) -> dict:
     """Analyze one clip (or the synthetic demo when video_path is None).
 
     Returns the report dict; writes report.json, play_data.json,
@@ -49,13 +49,16 @@ def analyze_clip(video_path: str | None, name: str, use_vlm: bool = False,
         log(f"[1/5] reusing cached tracks from {tracks_pkl}")
         with open(tracks_pkl, "rb") as f:
             tracks = pickle.load(f)
-        # detections are cached raw, so the (cheap) ball-linking step re-runs
-        # with the current algorithm — linking tweaks don't need re-detection
+        # detections are cached raw, so the cheap post-processing (team
+        # assignment, ball linking) re-runs with the current algorithms —
+        # tuning those doesn't need re-detection
+        from .tracking import recompute_teams
+        recompute_teams(tracks)
         if getattr(tracks, "ball_candidates", None) is not None:
             from .tracking import _link_ball
             tracks.ball = _link_ball(tracks.ball_candidates, tracks.n_frames,
                                      tracks.players, tracks.fps,
-                                     tracks.cam_affines)
+                                     tracks.cam_affines, tracks.teams)
     else:
         from .tracking import track_video
         log(f"[1/5] tracking players and ball in {video_path} (CPU, a few min)...")
@@ -117,6 +120,11 @@ def analyze_clip(video_path: str | None, name: str, use_vlm: bool = False,
         log("      writing annotated video (tracking overlay)...")
         annotate_video(video_path, tracks, events, str(out_dir / "annotated.mp4"))
         video_rel = "annotated.mp4"
+        if debug:
+            from .visualize import debug_ball_video, debug_players_video
+            log("      writing debug videos (ball candidates, player tracks)...")
+            debug_ball_video(video_path, tracks, str(out_dir / "debug_ball.mp4"))
+            debug_players_video(video_path, tracks, str(out_dir / "debug_players.mp4"))
 
     data = build_play_data(tracks, events, momentum, report, video_rel)
     (out_dir / "play_data.json").write_text(json.dumps(data))
