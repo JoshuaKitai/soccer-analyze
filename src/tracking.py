@@ -181,8 +181,12 @@ def assign_teams(players: dict[int, np.ndarray],
         labels3, centers3 = _kmeans(mat, k=3)
         sizes = [int((labels3 == j).sum()) for j in range(3)]
         smallest = int(np.argmin(sizes))
-        # a genuinely small third cluster (distinct kit) = the officials
-        if 0 < sizes[smallest] <= max(2, round(0.2 * len(tids))):
+        # a genuinely small third cluster (distinct kit) = the officials.
+        # HARD CAP at 3 tracks: a match has at most ~3 visible officials, and
+        # anything bigger is one of the teams (which must never be exiled —
+        # an "official" team can't possess the ball, so every color downstream
+        # goes wrong).
+        if 0 < sizes[smallest] <= 3:
             mains = [j for j in range(3) if j != smallest]
             for t, lab in zip(tids, labels3):
                 teams[t] = -1 if lab == smallest else mains.index(lab)
