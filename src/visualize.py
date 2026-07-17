@@ -305,7 +305,8 @@ def debug_players_video(video_path: str, tracks: TrackData, out_path: str) -> No
 CARRIER_C = "#2a78d6"     # blue: the player in possession
 TEAMMATE_C = "#008300"    # green: their teammates
 OPPONENT_C = "#e34948"    # red: the opposing team
-OFFICIAL_C = "#eda100"    # yellow: referees / officials
+OFFICIAL_C = "#ffe11a"    # yellow: referees / officials (bright, reads as
+                          # yellow on grass — the amber #eda100 read as orange)
 
 
 def annotate_video(video_path: str, tracks: TrackData, events, out_path: str) -> None:
