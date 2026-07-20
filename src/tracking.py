@@ -161,71 +161,69 @@ def _kmeans(colors: np.ndarray, k: int = 2, iters: int = 25,
     return labels, centers
 
 
-# Luminance weight for kit clustering. Raw BGR (implicitly L-weight ~1)
-# separates players by brightness — sun vs. shadow — so a saturated team gets
-# split across the lightness axis (the bug this fixes). Pure chroma (weight 0)
-# fixes that but can't tell white from black (they differ only in L). 0.3
-# keeps saturated teams unified while retaining enough L to separate
-# white-vs-dark kits; empirically saturated teams stay clean up to ~0.5.
-_KIT_L_WEIGHT = 0.3
+# Officials wear deliberately-distinct high-visibility kits (fluorescent
+# yellow/green/pink). A track is a candidate official when its kit chroma
+# (distance from neutral gray in LAB a,b) exceeds this — BUT only when such
+# tracks are a clear minority. If a large share of tracks are saturated, a
+# whole TEAM wears a bright kit (e.g. teal vs. white) and must not be exiled.
+_CHROMA_OFFICIAL = 40.0
+_OFFICIAL_MAX_FRACTION = 0.25
 
 
-def _kit_features(colors: dict[int, np.ndarray], tids: list[int]) -> np.ndarray:
-    """Map mean-BGR kit colors into weighted LAB (chroma-dominant).
-
-    L (luminance) is downweighted so teams split by jersey color rather than
-    lighting; a and b (the color plane) carry full weight and are
-    perceptually uniform. White/gray/black kits collapse near the neutral
-    point instead of getting random hues the way normalized-RGB would, and
-    the retained L still separates a white team from a black one.
-    """
+def _kit_lab(colors: dict[int, np.ndarray], tids: list[int]) -> np.ndarray:
+    """Mean-BGR kit colors -> LAB (L, a, b)."""
     import cv2
 
     bgr = np.clip(np.array([colors[t] for t in tids]), 0, 255).astype(np.uint8)
-    lab = cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(float)
-    lab[:, 0] *= _KIT_L_WEIGHT
-    return lab
+    return cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(float)
 
 
 def assign_teams(players: dict[int, np.ndarray],
                  colors: dict[int, np.ndarray]) -> dict[int, int]:
     """Team assignment from kit colors, with officials isolated.
 
-    Clustering runs in the LAB chroma plane (see _kit_features) so teams are
-    split by jersey color rather than brightness. First tries THREE clusters:
-    referees wear their own kit, so when a small third color group exists it's
-    marked as officials (-1) and the two big groups become the teams. Falls
-    back to two clusters with distance-based outlier rejection. Frame-border
-    dwell (sideline officials) is applied by the caller on top of this.
+    Two failure modes have to be handled at once, and they pull in opposite
+    directions:
+      - teams that differ by HUE (teal vs. white): clustering must not split
+        on brightness (a shadowed teal player is still teal);
+      - teams that differ by BRIGHTNESS (bright striped kit vs. dark kit,
+        e.g. Athletic Bilbao vs. Barcelona): clustering must not ignore
+        luminance, since that's the only thing separating them.
+    A fixed feature weighting can't win both, and referees in fluorescent
+    kits are extreme outliers that hijack a naive 2-cluster split (both teams
+    collapse together while the refs become a "team").
+
+    Approach: isolate officials FIRST as high-chroma outliers — but only when
+    they're a clear minority, so a saturated team isn't mistaken for referees.
+    Then force exactly two teams on the remaining players in STANDARDIZED LAB,
+    so whichever axis (luminance or hue) actually carries the team difference
+    drives the split. Frame-border dwell (sideline officials) is layered on by
+    the caller.
     """
     teams: dict[int, int] = {tid: -1 for tid in players}
     tids = [t for t in players if t in colors]
     if len(tids) < 2:
         return teams
-    feat = _kit_features(colors, tids)
+    lab = _kit_lab(colors, tids)
+    chroma = np.linalg.norm(lab[:, 1:] - 128.0, axis=1)
 
-    if len(tids) >= 6:
-        labels3, centers3 = _kmeans(feat, k=3)
-        sizes = [int((labels3 == j).sum()) for j in range(3)]
-        smallest = int(np.argmin(sizes))
-        # a genuinely small third cluster (distinct kit) = the officials.
-        # HARD CAP at 3 tracks: a match has at most ~3 visible officials, and
-        # anything bigger is one of the teams (which must never be exiled —
-        # an "official" team can't possess the ball, so every color downstream
-        # goes wrong).
-        if 0 < sizes[smallest] <= 3:
-            mains = [j for j in range(3) if j != smallest]
-            for t, lab in zip(tids, labels3):
-                teams[t] = -1 if lab == smallest else mains.index(lab)
-            return teams
+    # officials = fluorescent-kit minority
+    official = chroma > _CHROMA_OFFICIAL
+    if official.sum() > _OFFICIAL_MAX_FRACTION * len(tids):
+        official[:] = False   # too many to be refs — a team is saturated
 
-    labels, centers = _kmeans(feat, k=2)
-    sep = float(np.linalg.norm(centers[0] - centers[1]))
-    for i, (t, lab) in enumerate(zip(tids, labels)):
-        if sep > 1e-6 and np.linalg.norm(feat[i] - centers[lab]) > 1.0 * sep:
-            teams[t] = -1   # fits neither kit: referee or goalkeeper
-        else:
-            teams[t] = int(lab)
+    team_idx = np.where(~official)[0]
+    for i in np.where(official)[0]:
+        teams[tids[i]] = -1
+    if len(team_idx) < 2:
+        return teams
+
+    # standardize so the axis with the real between-team variance dominates
+    sub = lab[team_idx]
+    z = (sub - sub.mean(axis=0)) / (sub.std(axis=0) + 1e-6)
+    labels, _ = _kmeans(z, k=2)
+    for j, i in enumerate(team_idx):
+        teams[tids[i]] = int(labels[j])
     return teams
 
 
